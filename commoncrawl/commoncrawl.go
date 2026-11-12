@@ -2,6 +2,7 @@ package commoncrawl
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -14,8 +15,10 @@ import (
 	"github.com/slyrz/warc"
 )
 
+// INDEX_SERVER is a variable (not a const) so tests can point it at a local server.
+var INDEX_SERVER = "https://index.commoncrawl.org/"
+
 const (
-	INDEX_SERVER  = "https://index.commoncrawl.org/"
 	CRAWL_STORAGE = "https://data.commoncrawl.org/" // https://commoncrawl.s3.amazonaws.com/
 )
 
@@ -98,11 +101,15 @@ func (cc *CommonCrawl) GetIndexes() ([]latestIndex, error) {
 //
 //	index: needs to be set manually here like "CC-MAIN-2023-14"
 func (cc *CommonCrawl) GetNumPagesIndex(url, index string) (int, error) {
+	return cc.getNumPagesIndex(context.Background(), url, index)
+}
+
+func (cc *CommonCrawl) getNumPagesIndex(ctx context.Context, url, index string) (int, error) {
 	requestURI := fmt.Sprintf("%v%v-index?url=%v&showNumPages=true", INDEX_SERVER, index, url)
 
-	response, err := common.Get(requestURI, cc.MaxTimeout, cc.MaxRetries)
+	response, err := common.GetContext(ctx, requestURI, cc.MaxTimeout, cc.MaxRetries)
 	if err != nil {
-		return 0, fmt.Errorf("[GetNumPagesIndex] Request error: %v", err)
+		return 0, fmt.Errorf("[GetNumPagesIndex] Request error: %w", err)
 	}
 
 	numPagesResp := numPagesResponse{}
@@ -169,6 +176,11 @@ func (cc *CommonCrawl) GetPagesIndex(config common.RequestConfig, index string) 
 			return results, fmt.Errorf("[GetPagesIndex] Request error: %w", err)
 		}
 
+		// Only parse non-empty 200 bodies
+		if len(response) == 0 {
+			continue
+		}
+
 		parsedResponse, err := cc.ParseResponse(response)
 		if err != nil {
 			return results, fmt.Errorf("[GetPagesIndex] Cannot parse response: %w", err)
@@ -194,36 +206,70 @@ func (cc *CommonCrawl) GetPages(config common.RequestConfig) ([]*common.CdxRespo
 // FetchPages is a concurrent way to GetPages.
 // Makes request to CommonCrawl index API and returns observations in a channel.
 //
+// Only 200 bodies with content are parsed. A failing index or page is
+// reported through the errors channel and skipped without discarding results
+// from other indices; the function returns early when ctx is cancelled or
+// the configured limit is reached, and never blocks on a channel send after
+// cancellation.
+//
 //	index: needs to be set manually here
-func (cc *CommonCrawl) FetchPages(config common.RequestConfig, results chan []*common.CdxResponse, errors chan error) {
-	var err error
-
+func (cc *CommonCrawl) FetchPages(ctx context.Context, config common.RequestConfig, results chan<- []*common.CdxResponse, errors chan<- error) {
 	numResults := 0
 
 	for _, idx := range cc.filterIndices(config) {
+		if ctx.Err() != nil {
+			return
+		}
+
 		pages := 1
 		if !config.SinglePage {
-			pages, err = cc.GetNumPagesIndex(config.URL, idx)
+			var err error
+			pages, err = cc.getNumPagesIndex(ctx, config.URL, idx)
 			if err != nil {
-				errors <- err
+				if !common.SendError(ctx, errors, fmt.Errorf("[FetchPages] Cannot get number of pages for index %v: %w", idx, err)) {
+					return
+				}
+				continue
 			}
 		}
 
 		indexURL := fmt.Sprintf("%v%v-index", INDEX_SERVER, idx)
 		for page := 0; page < pages; page++ {
+			if ctx.Err() != nil {
+				return
+			}
+
 			reqURL := config.GetUrl(indexURL, page)
 
-			response, err := common.Get(reqURL, cc.MaxTimeout, cc.MaxRetries)
+			response, err := common.GetContext(ctx, reqURL, cc.MaxTimeout, cc.MaxRetries)
 			if err != nil {
-				errors <- fmt.Errorf("[FetchPages] Request error: %w", err)
+				if !common.SendError(ctx, errors, fmt.Errorf("[FetchPages] Request error: %w", err)) {
+					return
+				}
+				continue
+			}
+
+			// Only parse non-empty 200 bodies; an empty body means no results.
+			if len(response) == 0 {
+				continue
 			}
 
 			parsedResponse, err := cc.ParseResponse(response)
 			if err != nil {
-				errors <- fmt.Errorf("[FetchPages] Cannot parse response: %w", err)
+				if !common.SendError(ctx, errors, fmt.Errorf("[FetchPages] Cannot parse response: %w", err)) {
+					return
+				}
+				continue
+			}
+
+			if len(parsedResponse) == 0 {
+				continue
 			}
 			numResults += len(parsedResponse)
-			results <- parsedResponse
+
+			if !common.SendResults(ctx, results, parsedResponse) {
+				return
+			}
 
 			if config.Limit != 0 && uint(numResults) >= config.Limit {
 				return

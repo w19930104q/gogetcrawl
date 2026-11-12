@@ -1,20 +1,21 @@
 package cmd
 
 import (
+	"context"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
-	"time"
+	"syscall"
 
 	"github.com/karust/gogetcrawl/common"
 	"github.com/spf13/cobra"
 )
 
 type fileScenario struct {
-	finishedWorkers uint
-	outputDir       string
-	downloadRate    float32
+	outputDir    string
+	downloadRate float32
 }
 
 var fileScn = fileScenario{}
@@ -27,32 +28,88 @@ var fileCMD = &cobra.Command{
 	Run:     fileScn.spawnWorkers,
 }
 
-func (fs *fileScenario) worker(configs <-chan common.RequestConfig) {
-	for {
-		select {
-		case config, ok := <-configs:
-			if ok {
-				var wg sync.WaitGroup
-				for _, s := range sources {
+// worker consumes request configs and fans each one out to all sources,
+// which push batches into fetchResults. It returns once the configs channel
+// is drained; every source goroutine it spawns is joined before the worker
+// moves on or exits.
+func (fs *fileScenario) worker(ctx context.Context, configs <-chan common.RequestConfig, fetchResults chan<- []*common.CdxResponse) {
+	for config := range configs {
+		var wg sync.WaitGroup
+		for _, s := range sources {
+			wg.Add(1)
+			go func(s common.Source) {
+				defer wg.Done()
+				s.FetchPages(ctx, config, fetchResults, errors)
+			}(s)
+		}
+		wg.Wait()
+	}
+}
 
-					wg.Add(1)
-					go func(s common.Source) {
-						defer wg.Done()
-						s.FetchPages(config, results, errors)
-					}(s)
+// run drives the download fan-in and returns only after every goroutine it
+// started has finished:
+//
+//   - workers fetch batches into an internal channel; they are cancelled
+//     (via a child context) once maxResults is reached or ctx is done;
+//   - a forwarder applies maxResults exactly to the total number of usable
+//     results across all sources and closes the results channel when
+//     fetching is over;
+//   - a single SaveFiles consumer drains the results channel — it keeps
+//     draining batches already forwarded after the limit is hit, so the
+//     limit is exact;
+//   - the errors channel is closed only after both fetchers and the saver
+//     are done, so nothing ever sends on a closed channel.
+func (fs *fileScenario) run(ctx context.Context, configs <-chan common.RequestConfig) {
+	fetchCtx, stopFetch := context.WithCancel(ctx)
+	defer stopFetch()
 
-					//wg.Add(1)
-					go func() {
-						//defer wg.Done()
-						common.SaveFiles(results, fs.outputDir, errors, fs.downloadRate)
-					}()
+	fetchResults := make(chan []*common.CdxResponse)
+
+	var wg sync.WaitGroup
+	for i := uint(0); i < maxWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fs.worker(fetchCtx, configs, fetchResults)
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(fetchResults)
+	}()
+
+	saverDone := make(chan struct{})
+	go func() {
+		defer close(saverDone)
+		common.SaveFiles(ctx, results, fs.outputDir, errors, fs.downloadRate)
+	}()
+
+	go func() {
+		defer close(results)
+		var collected uint
+		for batch := range fetchResults {
+			if maxResults != 0 && collected+uint(len(batch)) > maxResults {
+				batch = batch[:maxResults-collected]
+			}
+			if len(batch) > 0 {
+				if !common.SendResults(ctx, results, batch) {
+					return
 				}
-				wg.Wait()
-			} else {
-				fs.finishedWorkers += 1
-				return
+				collected += uint(len(batch))
+			}
+			if maxResults != 0 && collected >= maxResults {
+				stopFetch()
 			}
 		}
+	}()
+
+	go func() {
+		<-saverDone
+		close(errors)
+	}()
+
+	for err := range errors {
+		log.Printf("ERROR: %v\n", err)
 	}
 }
 
@@ -68,37 +125,11 @@ func (fs *fileScenario) spawnWorkers(cmd *cobra.Command, args []string) {
 	configs := getRequestConfigs(args)
 	initSources()
 
-	var wg sync.WaitGroup
-
-	// Spawn Workers
-	go func() {
-		for i := uint(0); i < maxWorkers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				fs.worker(configs)
-			}()
-		}
-	}()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	close(configs)
-
-	// Read Results and errors
-	for fs.finishedWorkers != maxWorkers {
-		select {
-		case err, ok := <-errors:
-			if ok {
-				log.Printf("ERROR: %v\n", err)
-			}
-		// Unblock if no errors produced
-		case <-time.After(time.Second * 3):
-			continue
-		}
-	}
-
-	wg.Wait()
-	close(errors)
-	close(results)
+	fs.run(ctx, configs)
 }
 
 func init() {

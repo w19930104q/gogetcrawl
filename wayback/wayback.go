@@ -1,14 +1,18 @@
 package wayback
 
 import (
+	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	jsoniter "github.com/json-iterator/go"
 	common "github.com/karust/gogetcrawl/common"
 )
 
-const INDEX_SERVER = "https://web.archive.org/cdx/search/cdx"
+// INDEX_SERVER is a variable (not a const) so tests can point it at a local server.
+var INDEX_SERVER = "https://web.archive.org/cdx/search/cdx"
+
 const CRAWL_STORAGE = "https://web.archive.org/web"
 
 type Wayback struct {
@@ -27,15 +31,22 @@ func (Wayback) Name() string {
 
 // Return the number of pages located in WebArchive for given url
 func (wb *Wayback) GetNumPages(url string) (int, error) {
+	return wb.getNumPages(context.Background(), url)
+}
 
+func (wb *Wayback) getNumPages(ctx context.Context, url string) (int, error) {
 	requestURI := fmt.Sprintf("%v?url=%v&showNumPages=true", INDEX_SERVER, url)
-	response, err := common.Get(requestURI, wb.MaxTimeout, wb.MaxRetries)
+	response, err := common.GetContext(ctx, requestURI, wb.MaxTimeout, wb.MaxRetries)
 	if err != nil {
-		return 0, fmt.Errorf("[GetNumPages] Request error: %v", err)
+		return 0, fmt.Errorf("[GetNumPages] Request error: %w", err)
 	}
 
 	// Remove return and convert to integer
-	strRes := string(response[:len(response)-1])
+	strRes := strings.TrimSpace(string(response))
+	if strRes == "" {
+		return 0, fmt.Errorf("[GetNumPages] Empty response")
+	}
+
 	res, err := strconv.Atoi(strRes)
 	if err != nil {
 		return 0, fmt.Errorf("[GetNumPages] Cannot convert response value: %v", response)
@@ -102,6 +113,11 @@ func (wb *Wayback) GetPages(config common.RequestConfig) ([]*common.CdxResponse,
 			return results, fmt.Errorf("[GetPages] Request error: %v", err)
 		}
 
+		// Only parse non-empty 200 bodies
+		if len(response) == 0 {
+			continue
+		}
+
 		parsedResponse, err := wb.ParseResponse(response)
 		if err != nil {
 			return results, fmt.Errorf("[GetPages] Cannot parse response: %v", err)
@@ -119,36 +135,61 @@ func (wb *Wayback) GetPages(config common.RequestConfig) ([]*common.CdxResponse,
 
 // FetchPages ... Concurrent way to GetPages.
 // Makes request to WebArchive CDX API and return observations in a channel.
-func (wb *Wayback) FetchPages(config common.RequestConfig, results chan []*common.CdxResponse, errors chan error) {
-	var pages int
-	var err error
+//
+// Only 200 bodies with content are parsed. Request and parse failures are
+// reported through the errors channel and the source moves on; the function
+// returns early when ctx is cancelled or the configured limit is reached,
+// and never blocks on a channel send after cancellation.
+func (wb *Wayback) FetchPages(ctx context.Context, config common.RequestConfig, results chan<- []*common.CdxResponse, errors chan<- error) {
+	pages := 1
 
-	if config.SinglePage {
-		pages = 1
-	} else {
-		pages, err = wb.GetNumPages(config.URL)
+	if !config.SinglePage {
+		var err error
+		pages, err = wb.getNumPages(ctx, config.URL)
 		if err != nil {
-			errors <- err
+			common.SendError(ctx, errors, fmt.Errorf("[FetchPages] Cannot get number of pages: %w", err))
+			return
 		}
 	}
 
 	numResults := 0
 
 	for page := 0; page < pages; page++ {
+		if ctx.Err() != nil {
+			return
+		}
+
 		reqURL := config.GetUrl(INDEX_SERVER, page)
 
-		response, err := common.Get(reqURL, wb.MaxTimeout, wb.MaxRetries)
+		response, err := common.GetContext(ctx, reqURL, wb.MaxTimeout, wb.MaxRetries)
 		if err != nil {
-			errors <- fmt.Errorf("[FetchPages] Request error: %v", err)
+			if !common.SendError(ctx, errors, fmt.Errorf("[FetchPages] Request error: %w", err)) {
+				return
+			}
+			continue
+		}
+
+		// Only parse non-empty 200 bodies; an empty body means no results.
+		if len(response) == 0 {
+			continue
 		}
 
 		parsedResponse, err := wb.ParseResponse(response)
 		if err != nil {
-			errors <- fmt.Errorf("[FetchPages] Cannot parse response: %v", err)
+			if !common.SendError(ctx, errors, fmt.Errorf("[FetchPages] Cannot parse response: %w", err)) {
+				return
+			}
+			continue
+		}
+
+		if len(parsedResponse) == 0 {
+			continue
 		}
 		numResults += len(parsedResponse)
 
-		results <- parsedResponse
+		if !common.SendResults(ctx, results, parsedResponse) {
+			return
+		}
 
 		if config.Limit != 0 && uint(numResults) >= config.Limit {
 			return

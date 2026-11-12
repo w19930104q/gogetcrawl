@@ -1,6 +1,7 @@
 package wayback
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -36,6 +37,9 @@ func TestParseResponse(t *testing.T) {
 }
 
 func TestGetNumPages(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live Web Archive test in short mode")
+	}
 	want := 1
 
 	parsedResp, err := wb.GetNumPages("kamaloff.ru")
@@ -50,6 +54,9 @@ func TestGetNumPages(t *testing.T) {
 }
 
 func TestGetPages(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live Web Archive test in short mode")
+	}
 	config := common.RequestConfig{
 		URL:     "*.kamaloff.ru/*",
 		Filters: []string{"statuscode:200"},
@@ -70,6 +77,9 @@ func TestGetPages(t *testing.T) {
 }
 
 func TestFetchPages(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live Web Archive test in short mode")
+	}
 	config1 := common.RequestConfig{
 		URL:        "tutorialspoint.com/*",
 		Filters:    []string{"statuscode:200", "mimetype:text/html"},
@@ -88,11 +98,11 @@ func TestFetchPages(t *testing.T) {
 	errorsChan := make(chan error)
 
 	go func() {
-		wb.FetchPages(config1, resultsChan, errorsChan)
+		wb.FetchPages(context.Background(), config1, resultsChan, errorsChan)
 	}()
 
 	go func() {
-		wb.FetchPages(config2, resultsChan, errorsChan)
+		wb.FetchPages(context.Background(), config2, resultsChan, errorsChan)
 	}()
 
 	var results []*common.CdxResponse
@@ -128,6 +138,9 @@ func TestFetchPages(t *testing.T) {
 }
 
 func TestGetFile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live Web Archive test in short mode")
+	}
 	config := common.RequestConfig{
 		URL:     "kamaloff.ru/*",
 		Filters: []string{"statuscode:200", "mimetype:text/html"},

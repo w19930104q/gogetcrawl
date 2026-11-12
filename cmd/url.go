@@ -1,19 +1,21 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 
 	"github.com/karust/gogetcrawl/common"
 	"github.com/spf13/cobra"
 )
 
 type urlScenario struct {
-	outputFile      string
-	finishedWorkers uint
+	outputFile string
 }
 
 var urlScn = urlScenario{}
@@ -26,27 +28,79 @@ var urlCMD = &cobra.Command{
 	Run:     urlScn.spawnWorkers,
 }
 
-func (us *urlScenario) worker(configs chan common.RequestConfig) {
-	for {
-		select {
-		case config, ok := <-configs:
-			if ok {
-				var wg sync.WaitGroup
+// worker consumes request configs and fans each one out to all sources.
+// It returns once the configs channel is drained; every source goroutine it
+// spawns is joined before the worker moves on or exits.
+func (us *urlScenario) worker(ctx context.Context, configs <-chan common.RequestConfig) {
+	for config := range configs {
+		var wg sync.WaitGroup
 
-				for _, s := range sources {
-					wg.Add(1)
-					go func(s common.Source) {
-						defer wg.Done()
-						s.FetchPages(config, results, errors)
-					}(s)
-				}
-				wg.Wait()
-			} else {
-				us.finishedWorkers += 1
-				return
+		for _, s := range sources {
+			wg.Add(1)
+			go func(s common.Source) {
+				defer wg.Done()
+				s.FetchPages(ctx, config, results, errors)
+			}(s)
+		}
+		wg.Wait()
+	}
+}
+
+// run drives the fan-in: it starts the workers, closes the result and error
+// channels only after every worker finished (so nothing ever sends on a
+// closed channel), and collects batches until both channels are closed.
+// maxResults, when set, applies exactly to the total number of usable
+// results written to the output, across all sources; reaching it cancels the
+// remaining work. It returns the number of results written.
+func (us *urlScenario) run(ctx context.Context, cancel context.CancelFunc, configs <-chan common.RequestConfig, output io.Writer) uint {
+	var wg sync.WaitGroup
+
+	// Spawn Workers
+	for i := uint(0); i < maxWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			us.worker(ctx, configs)
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+		close(errors)
+	}()
+
+	resultsCh, errorsCh := results, errors
+	var collected uint
+
+	for resultsCh != nil || errorsCh != nil {
+		select {
+		case res, ok := <-resultsCh:
+			if !ok {
+				resultsCh = nil
+				continue
 			}
+			if maxResults != 0 && collected+uint(len(res)) > maxResults {
+				res = res[:maxResults-collected]
+			}
+			if len(res) == 0 {
+				continue
+			}
+			fmt.Fprintf(output, "%v", us.formatResultOutput(res))
+			collected += uint(len(res))
+			if maxResults != 0 && collected >= maxResults {
+				cancel()
+			}
+		case err, ok := <-errorsCh:
+			if !ok {
+				errorsCh = nil
+				continue
+			}
+			log.Println(err)
 		}
 	}
+
+	return collected
 }
 
 func (us *urlScenario) spawnWorkers(cmd *cobra.Command, args []string) {
@@ -58,38 +112,13 @@ func (us *urlScenario) spawnWorkers(cmd *cobra.Command, args []string) {
 	configs := getRequestConfigs(args)
 	initSources()
 
-	var wg sync.WaitGroup
-
-	// Spawn Workers
-	go func() {
-		for i := uint(0); i < maxWorkers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				us.worker(configs)
-			}()
-		}
-	}()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	close(configs)
-
-	// Read Results and errors
-	for us.finishedWorkers != maxWorkers {
-		select {
-		case res, ok := <-results:
-			if ok {
-				fmt.Fprintf(output, "%v", us.formatResultOutput(res))
-			}
-		case err, ok := <-errors:
-			if ok {
-				log.Println(err)
-			}
-		}
-	}
-
-	wg.Wait()
-	close(results)
-	close(errors)
+	us.run(ctx, cancel, configs, output)
 }
 
 func (us *urlScenario) getOutputTarget() (io.Writer, error) {
