@@ -5,16 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/karust/gogetcrawl/common"
 	"github.com/spf13/cobra"
 )
 
 type fileScenario struct {
-	finishedWorkers uint
-	outputDir       string
-	downloadRate    float32
+	outputDir    string
+	downloadRate float32
 }
 
 var fileScn = fileScenario{}
@@ -25,35 +23,6 @@ var fileCMD = &cobra.Command{
 	Short:   "Download files located in web arhives for desired domains",
 	Args:    cobra.MatchAll(cobra.MinimumNArgs(1), cobra.OnlyValidArgs),
 	Run:     fileScn.spawnWorkers,
-}
-
-func (fs *fileScenario) worker(configs <-chan common.RequestConfig) {
-	for {
-		select {
-		case config, ok := <-configs:
-			if ok {
-				var wg sync.WaitGroup
-				for _, s := range sources {
-
-					wg.Add(1)
-					go func(s common.Source) {
-						defer wg.Done()
-						s.FetchPages(config, results, errors)
-					}(s)
-
-					//wg.Add(1)
-					go func() {
-						//defer wg.Done()
-						common.SaveFiles(results, fs.outputDir, errors, fs.downloadRate)
-					}()
-				}
-				wg.Wait()
-			} else {
-				fs.finishedWorkers += 1
-				return
-			}
-		}
-	}
 }
 
 func (fs *fileScenario) spawnWorkers(cmd *cobra.Command, args []string) {
@@ -68,37 +37,31 @@ func (fs *fileScenario) spawnWorkers(cmd *cobra.Command, args []string) {
 	configs := getRequestConfigs(args)
 	initSources()
 
+	ctx, stop := newSignalContext()
+	defer stop()
+
 	var wg sync.WaitGroup
 
 	// Spawn Workers
-	go func() {
-		for i := uint(0); i < maxWorkers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				fs.worker(configs)
-			}()
-		}
-	}()
+	for i := uint(0); i < maxWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for config := range configs {
+				results, err := common.FetchAll(ctx, sources, config)
+				if err != nil {
+					log.Printf("ERROR: %v\n", err)
+				}
 
-	close(configs)
-
-	// Read Results and errors
-	for fs.finishedWorkers != maxWorkers {
-		select {
-		case err, ok := <-errors:
-			if ok {
-				log.Printf("ERROR: %v\n", err)
+				if err := common.SaveResults(ctx, results, fs.outputDir, fs.downloadRate); err != nil {
+					log.Printf("ERROR: %v\n", err)
+				}
 			}
-		// Unblock if no errors produced
-		case <-time.After(time.Second * 3):
-			continue
-		}
+		}()
 	}
 
+	close(configs)
 	wg.Wait()
-	close(errors)
-	close(results)
 }
 
 func init() {

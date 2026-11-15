@@ -1,12 +1,15 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"mime"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/karust/gogetcrawl/common"
@@ -44,9 +47,13 @@ You can use different filters and arguments to solve your task more effectively.
 
 var (
 	sources []common.Source
-	results = make(chan []*common.CdxResponse)
-	errors  = make(chan error)
 )
+
+// newSignalContext returns a context cancelled on SIGINT/SIGTERM, so all
+// in-flight requests and goroutines shut down promptly.
+func newSignalContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}
 
 func initSources() {
 	for _, s := range sourceNames {

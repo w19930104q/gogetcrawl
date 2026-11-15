@@ -85,7 +85,7 @@ func main() {
 	wb, _ := wayback.New(15, 2)
 
 	// Use config to obtain all CDX server responses
-	results, _ := wb.GetPages(config)
+	results, _ := wb.GetPages(context.Background(), config)
 
 	for _, r := range results {
 		fmt.Println(r.Urlkey, r.Original, r.MimeType)
@@ -102,10 +102,10 @@ config := common.RequestConfig{
 }
 
 wb, _ := wayback.New(15, 2)
-results, _ := wb.GetPages(config)
+results, _ := wb.GetPages(context.Background(), config)
 
 // Get first file from CDX response
-file, err := wb.GetFile(results[0])
+file, err := wb.GetFile(context.Background(), results[0])
 
 fmt.Println(string(file))
 ```
@@ -116,40 +116,18 @@ fmt.Println(string(file))
 * **Get urls**
 ```go
 cc, _ := commoncrawl.New(30, 3)
+wb, _ := wayback.New(30, 3)
 
-config1 := common.RequestConfig{
+config := common.RequestConfig{
 	URL:        "*.tutorialspoint.com/*",
 	Filters:    []string{"statuscode:200", "mimetype:text/html"},
 	Limit:      6,
 }
 
-config2 := common.RequestConfig{
-	URL:        "example.com/*",
-	Filters:    []string{"statuscode:200", "mimetype:text/html"},
-	Limit:      6,
-}
-
-resultsChan := make(chan []*common.CdxResponse)
-errorsChan := make(chan error)
-
-go func() {
-	cc.FetchPages(config1, resultsChan, errorsChan)
-}()
-
-go func() {
-	cc.FetchPages(config2, resultsChan, errorsChan)
-}()
-
-for {
-	select {
-	case err := <-errorsChan:
-		fmt.Printf("FetchPages goroutine failed: %v", err)
-	case res, ok := <-resultsChan:
-		if ok {
-			fmt.Println(res)
-		}
-	}
-}
+// Query both sources concurrently. Results are merged, sorted
+// deterministically and truncated to the global limit; per-source
+// errors are aggregated.
+results, err := common.FetchAll(context.Background(), []common.Source{cc, wb}, config)
 ```
 
 * **Get files:**
@@ -160,8 +138,8 @@ config := common.RequestConfig{
 }
 
 cc, _ := commoncrawl.New(15, 2)
-results, _ := wb.GetPages(config)
-file, err := cc.GetFile(results[0])
+results, _ := cc.GetPages(context.Background(), config)
+file, err := cc.GetFile(context.Background(), results[0])
 ```
 
 ## Bugs + Features

@@ -1,24 +1,16 @@
 package common
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log"
 	"mime"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync"
 	"time"
-
-	"github.com/corpix/uarand"
-	"github.com/valyala/fasthttp"
-)
-
-var (
-	Status503Error = errors.New("Server returned 503 status response")
-	Status500Error = errors.New("Server returned 500 status response. (Slow down)")
 )
 
 // WebArchive and Common Crawl (index.commoncrawl.org) CDX API Response structure from
@@ -42,10 +34,10 @@ type CdxResponse struct {
 type Source interface {
 	Name() string
 	ParseResponse(resp []byte) ([]*CdxResponse, error)
-	GetNumPages(url string) (int, error)
-	GetPages(config RequestConfig) ([]*CdxResponse, error)
-	FetchPages(config RequestConfig, results chan []*CdxResponse, errors chan error)
-	GetFile(*CdxResponse) ([]byte, error)
+	GetNumPages(ctx context.Context, url string) (int, error)
+	GetPages(ctx context.Context, config RequestConfig) ([]*CdxResponse, error)
+	FetchPages(ctx context.Context, config RequestConfig, results chan []*CdxResponse, errors chan error)
+	GetFile(ctx context.Context, page *CdxResponse) ([]byte, error)
 }
 
 type RequestConfig struct {
@@ -90,71 +82,107 @@ func (config RequestConfig) GetUrl(serverURL string, page int) string {
 	return reqURL
 }
 
-func DoRequest(url string, timeout int, headers map[string]string) ([]byte, error) {
-	timeoutDuration := time.Second * time.Duration(timeout)
+// FetchAll queries all given sources concurrently and merges their results.
+//
+// The merged results are sorted deterministically (see SortCdxResponses) and
+// truncated to config.Limit if it is set, so the limit applies globally across
+// all sources and indexes rather than per index. Errors from individual
+// sources or pages don't abort the others; they are aggregated and returned
+// together with the results. All spawned goroutines exit before FetchAll
+// returns, even when ctx is cancelled.
+func FetchAll(ctx context.Context, sources []Source, config RequestConfig) ([]*CdxResponse, error) {
+	results := make(chan []*CdxResponse)
+	errs := make(chan error)
 
-	req := fasthttp.AcquireRequest()
-	req.SetRequestURI(url)
-	req.Header.SetMethod(fasthttp.MethodGet)
-	req.Header.Set(fasthttp.HeaderUserAgent, uarand.GetRandom())
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	defer fasthttp.ReleaseRequest(req)
-
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseResponse(resp)
-
-	client := &fasthttp.Client{}
-	client.ReadTimeout = timeoutDuration
-	err := client.DoTimeout(req, resp, timeoutDuration)
-	if err != nil {
-		return nil, fmt.Errorf("[GetRequest] Error making request: %v", err)
-	}
-
-	switch resp.StatusCode() {
-	case 500:
-		return nil, Status500Error
-	case 503:
-		return resp.Body(), Status503Error
+	var wg sync.WaitGroup
+	for _, s := range sources {
+		wg.Add(1)
+		go func(s Source) {
+			defer wg.Done()
+			s.FetchPages(ctx, config, results, errs)
+		}(s)
 	}
 
-	if len(resp.Body()) > 0 {
-		return resp.Body(), nil
+	// Close both channels once every source is done, so the collector below
+	// terminates and no goroutine is left behind.
+	go func() {
+		wg.Wait()
+		close(results)
+		close(errs)
+	}()
+
+	var all []*CdxResponse
+	var errList []error
+	for results != nil || errs != nil {
+		select {
+		case batch, ok := <-results:
+			if !ok {
+				results = nil
+				continue
+			}
+			all = append(all, batch...)
+		case err, ok := <-errs:
+			if !ok {
+				errs = nil
+				continue
+			}
+			errList = append(errList, err)
+		}
 	}
 
-	if resp.StatusCode() != 200 {
-		return nil, fmt.Errorf("[GetRequest] Got %v status response", resp.StatusCode())
+	SortCdxResponses(all)
+	if config.Limit != 0 && uint(len(all)) > config.Limit {
+		all = all[:config.Limit]
 	}
 
-	if resp.Body() == nil {
-		return nil, fmt.Errorf("[GetRequest] Response body is empty")
-	}
-
-	return resp.Body(), nil
+	return all, errors.Join(errList...)
 }
 
-// Get ... Performs HTTP GET request and returns response bytes
-func Get(url string, timeout int, maxRetries int) ([]byte, error) {
-	client := &http.Client{
-		Timeout: time.Duration(timeout) * time.Second,
-	}
-
-	var resp *http.Response
-	var err error
-
-	for i := 0; i < maxRetries; i++ {
-		log.Printf("GET [t=%v] [r=%v]: %v", timeout, maxRetries, url)
-
-		resp, err = client.Get(url)
-		if err == nil && resp.StatusCode == 200 {
-			break
+// SortCdxResponses sorts results deterministically by timestamp, then URL,
+// then source name, so merged multi-source output is stable across runs.
+func SortCdxResponses(results []*CdxResponse) {
+	sort.SliceStable(results, func(i, j int) bool {
+		a, b := results[i], results[j]
+		if a.Timestamp != b.Timestamp {
+			return a.Timestamp < b.Timestamp
 		}
-		log.Printf("Attempt %d failed: %v", i+1, err)
-		time.Sleep(time.Second * time.Duration(i+1))
+		if a.Original != b.Original {
+			return a.Original < b.Original
+		}
+		if a.Urlkey != b.Urlkey {
+			return a.Urlkey < b.Urlkey
+		}
+		return sourceName(a.Source) < sourceName(b.Source)
+	})
+}
+
+func sourceName(s Source) string {
+	if s == nil {
+		return ""
 	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	return s.Name()
+}
+
+// SendBatch delivers a batch of results unless the context is cancelled.
+// Returns false when the context is done and the batch was not sent.
+func SendBatch(ctx context.Context, results chan []*CdxResponse, batch []*CdxResponse) bool {
+	select {
+	case results <- batch:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// SendError delivers err unless the context is cancelled.
+// Returns false when the context is done and the error was not sent.
+func SendError(ctx context.Context, errs chan error, err error) bool {
+	select {
+	case errs <- err:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // Save data using file fullpath
@@ -167,30 +195,41 @@ func SaveFile(data []byte, path string) error {
 	return nil
 }
 
-// Save files from CDX Response channel into output directory
-func SaveFiles(results <-chan []*CdxResponse, outputDir string, errors chan error, downloadRate float32) {
-	for resBatch := range results {
-		for _, res := range resBatch {
-			data, err := res.Source.GetFile(res)
-			if err != nil {
-				errors <- err
-				continue
-			}
+// SaveResults saves files described by CDX responses into output directory.
+// Per-file errors are aggregated and returned; saving continues past them.
+func SaveResults(ctx context.Context, results []*CdxResponse, outputDir string, downloadRate float32) error {
+	var errList []error
 
-			exts, err := mime.ExtensionsByType(res.MimeType)
-			if err != nil || len(exts) == 0 {
-				errors <- fmt.Errorf("Cannot get extension from file")
-				continue
-			}
+	for _, res := range results {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
-			filename := fmt.Sprintf("%v-%v-%v%v", res.Original, res.Timestamp, res.Source.Name(), exts[0])
-			fullPath := filepath.Join(outputDir, url.QueryEscape(filename))
+		data, err := res.Source.GetFile(ctx, res)
+		if err != nil {
+			errList = append(errList, err)
+			continue
+		}
 
-			if err := SaveFile(data, fullPath); err != nil {
-				errors <- err
-			}
+		exts, err := mime.ExtensionsByType(res.MimeType)
+		if err != nil || len(exts) == 0 {
+			errList = append(errList, fmt.Errorf("Cannot get extension from file"))
+			continue
+		}
 
-			time.Sleep(time.Duration(downloadRate * float32(time.Second)))
+		filename := fmt.Sprintf("%v-%v-%v%v", res.Original, res.Timestamp, res.Source.Name(), exts[0])
+		fullPath := filepath.Join(outputDir, url.QueryEscape(filename))
+
+		if err := SaveFile(data, fullPath); err != nil {
+			errList = append(errList, err)
+		}
+
+		select {
+		case <-time.After(time.Duration(downloadRate * float32(time.Second))):
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
+
+	return errors.Join(errList...)
 }

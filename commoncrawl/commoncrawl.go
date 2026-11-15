@@ -2,6 +2,8 @@ package commoncrawl
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -55,15 +57,29 @@ type numPagesResponse struct {
 }
 
 type CommonCrawl struct {
-	MaxTimeout int           // Request timeout
-	MaxRetries int           // Max number of request retries if timeouted
-	indexes    []latestIndex // CDX Indexes versions cache
+	MaxTimeout int // Request timeout
+	MaxRetries int // Max number of request retries if timeouted
+
+	// IndexServer is the CDX index API base URL. Defaults to INDEX_SERVER.
+	IndexServer string
+	// StorageServer is the WARC storage base URL. Defaults to CRAWL_STORAGE.
+	StorageServer string
+	// Client is the HTTP client used for all requests. Defaults to a client
+	// built from MaxTimeout/MaxRetries.
+	Client *common.Client
+
+	indexes []latestIndex // CDX Indexes versions cache
 }
 
 func New(timeout, retries int) (*CommonCrawl, error) {
-	source := &CommonCrawl{MaxTimeout: timeout, MaxRetries: retries}
+	source := &CommonCrawl{
+		MaxTimeout: timeout,
+		MaxRetries: retries,
+		Client:     common.NewClient(timeout, retries),
+	}
+
 	var err error
-	source.indexes, err = source.GetIndexes()
+	source.indexes, err = source.GetIndexes(context.Background())
 	if err != nil {
 		log.Printf("Error fetching indexes: %v", err)
 		return nil, err
@@ -76,9 +92,30 @@ func (CommonCrawl) Name() string {
 	return "CommonCrawl"
 }
 
+func (cc *CommonCrawl) http() *common.Client {
+	if cc.Client != nil {
+		return cc.Client
+	}
+	return common.NewClient(cc.MaxTimeout, cc.MaxRetries)
+}
+
+func (cc *CommonCrawl) indexServer() string {
+	if cc.IndexServer != "" {
+		return cc.IndexServer
+	}
+	return INDEX_SERVER
+}
+
+func (cc *CommonCrawl) storageServer() string {
+	if cc.StorageServer != "" {
+		return cc.StorageServer
+	}
+	return CRAWL_STORAGE
+}
+
 // Get latest CDX indexes from http://index.commoncrawl.org/collinfo.json
-func (cc *CommonCrawl) GetIndexes() ([]latestIndex, error) {
-	response, err := common.Get(INDEX_SERVER+"collinfo.json", cc.MaxTimeout, cc.MaxRetries)
+func (cc *CommonCrawl) GetIndexes(ctx context.Context) ([]latestIndex, error) {
+	response, err := cc.http().Get(ctx, cc.indexServer()+"collinfo.json")
 	if err != nil {
 		return nil, fmt.Errorf("[GetIndexes] response read error: %v", err)
 	}
@@ -97,10 +134,10 @@ func (cc *CommonCrawl) GetIndexes() ([]latestIndex, error) {
 // Returns the number of pages located in CommonCrawl for given url
 //
 //	index: needs to be set manually here like "CC-MAIN-2023-14"
-func (cc *CommonCrawl) GetNumPagesIndex(url, index string) (int, error) {
-	requestURI := fmt.Sprintf("%v%v-index?url=%v&showNumPages=true", INDEX_SERVER, index, url)
+func (cc *CommonCrawl) GetNumPagesIndex(ctx context.Context, url, index string) (int, error) {
+	requestURI := fmt.Sprintf("%v%v-index?url=%v&showNumPages=true", cc.indexServer(), index, url)
 
-	response, err := common.Get(requestURI, cc.MaxTimeout, cc.MaxRetries)
+	response, err := cc.http().Get(ctx, requestURI)
 	if err != nil {
 		return 0, fmt.Errorf("[GetNumPagesIndex] Request error: %v", err)
 	}
@@ -116,20 +153,24 @@ func (cc *CommonCrawl) GetNumPagesIndex(url, index string) (int, error) {
 
 // Returns the number of pages located in CommonCrawl for given url
 // Use latest index from http://index.commoncrawl.org/collinfo.json
-func (cc *CommonCrawl) GetNumPages(url string) (int, error) {
-	return cc.GetNumPagesIndex(url, cc.indexes[0].Id)
+func (cc *CommonCrawl) GetNumPages(ctx context.Context, url string) (int, error) {
+	return cc.GetNumPagesIndex(ctx, url, cc.indexes[0].Id)
 }
 
 // Parse response from http://index.commoncrawl.org/[Index Version]-index index server
 func (cc *CommonCrawl) ParseResponse(resp []byte) ([]*common.CdxResponse, error) {
 	pages := []*common.CdxResponse{}
 
-	if len(resp) == 0 {
+	trimmed := bytes.TrimRight(resp, "\r\n\t ")
+	if len(trimmed) == 0 {
 		return nil, fmt.Errorf("Empty response provided")
 	}
 
 	// Parse the response that contains JSON objects separated with new line
-	for _, line := range bytes.Split(resp[:len(resp)-1], []byte{'\n'}) {
+	for _, line := range bytes.Split(trimmed, []byte{'\n'}) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
 		var indexVal common.CdxResponse
 		if err := jsoniter.Unmarshal(line, &indexVal); err != nil {
 			return nil, fmt.Errorf("[ParseResponse] Cannot decode JSON line: %w. Response: %v", err, string(line))
@@ -141,37 +182,49 @@ func (cc *CommonCrawl) ParseResponse(resp []byte) ([]*common.CdxResponse, error)
 	return pages, nil
 }
 
+// fetchPage requests and parses a single result page of an index.
+func (cc *CommonCrawl) fetchPage(ctx context.Context, config common.RequestConfig, indexURL string, page int) ([]*common.CdxResponse, error) {
+	reqURL := config.GetUrl(indexURL, page)
+
+	response, err := cc.http().Get(ctx, reqURL)
+	if err != nil {
+		return nil, fmt.Errorf("Request error: %w", err)
+	}
+
+	parsedResponse, err := cc.ParseResponse(response)
+	if err != nil {
+		return nil, fmt.Errorf("Cannot parse response: %w", err)
+	}
+
+	return parsedResponse, nil
+}
+
 // GetPagesIndex ... Makes request to WebArchive index API to gather all url observations
 //
 //	index: needs to be set manually here like "CC-MAIN-2023-14"
-func (cc *CommonCrawl) GetPagesIndex(config common.RequestConfig, index string) ([]*common.CdxResponse, error) {
-	var pages int
-	var err error
-
-	if config.SinglePage {
-		pages = 1
-	} else {
-		pages, err = cc.GetNumPagesIndex(config.URL, index)
+//
+// A broken page (request or parse failure) is skipped and its error
+// aggregated, so it doesn't pollute results from other pages.
+func (cc *CommonCrawl) GetPagesIndex(ctx context.Context, config common.RequestConfig, index string) ([]*common.CdxResponse, error) {
+	pages := 1
+	if !config.SinglePage {
+		var err error
+		pages, err = cc.GetNumPagesIndex(ctx, config.URL, index)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	var results []*common.CdxResponse
+	var errList []error
 	numResults := 0
 
+	indexURL := fmt.Sprintf("%v%v-index", cc.indexServer(), index)
 	for page := 0; page < pages; page++ {
-		indexURL := fmt.Sprintf("%v%v-index", INDEX_SERVER, index)
-		reqURL := config.GetUrl(indexURL, page)
-
-		response, err := common.Get(reqURL, cc.MaxTimeout, cc.MaxRetries)
+		parsedResponse, err := cc.fetchPage(ctx, config, indexURL, page)
 		if err != nil {
-			return results, fmt.Errorf("[GetPagesIndex] Request error: %w", err)
-		}
-
-		parsedResponse, err := cc.ParseResponse(response)
-		if err != nil {
-			return results, fmt.Errorf("[GetPagesIndex] Cannot parse response: %w", err)
+			errList = append(errList, fmt.Errorf("[GetPagesIndex] page %d: %w", page, err))
+			continue
 		}
 		results = append(results, parsedResponse...)
 		numResults += len(parsedResponse)
@@ -181,49 +234,56 @@ func (cc *CommonCrawl) GetPagesIndex(config common.RequestConfig, index string) 
 		}
 	}
 
-	return results, nil
+	return results, errors.Join(errList...)
 }
 
 // Makes request to the Commoncrawl index API to gather all offsets that contain chosen URL.
 //
 //	Uses the latest CommonCrawl index.
-func (cc *CommonCrawl) GetPages(config common.RequestConfig) ([]*common.CdxResponse, error) {
-	return cc.GetPagesIndex(config, cc.indexes[0].Id)
+func (cc *CommonCrawl) GetPages(ctx context.Context, config common.RequestConfig) ([]*common.CdxResponse, error) {
+	return cc.GetPagesIndex(ctx, config, cc.indexes[0].Id)
 }
 
 // FetchPages is a concurrent way to GetPages.
 // Makes request to CommonCrawl index API and returns observations in a channel.
 //
-//	index: needs to be set manually here
-func (cc *CommonCrawl) FetchPages(config common.RequestConfig, results chan []*common.CdxResponse, errors chan error) {
-	var err error
-
+// Broken pages are reported on the errors channel and skipped without
+// polluting other results. The limit applies across all filtered indexes.
+// The goroutine exits when done or when ctx is cancelled.
+func (cc *CommonCrawl) FetchPages(ctx context.Context, config common.RequestConfig, results chan []*common.CdxResponse, errs chan error) {
 	numResults := 0
 
 	for _, idx := range cc.filterIndices(config) {
 		pages := 1
 		if !config.SinglePage {
-			pages, err = cc.GetNumPagesIndex(config.URL, idx)
+			var err error
+			pages, err = cc.GetNumPagesIndex(ctx, config.URL, idx)
 			if err != nil {
-				errors <- err
+				if !common.SendError(ctx, errs, fmt.Errorf("[FetchPages] Cannot get number of pages: %w", err)) {
+					return
+				}
+				continue
 			}
 		}
 
-		indexURL := fmt.Sprintf("%v%v-index", INDEX_SERVER, idx)
+		indexURL := fmt.Sprintf("%v%v-index", cc.indexServer(), idx)
 		for page := 0; page < pages; page++ {
-			reqURL := config.GetUrl(indexURL, page)
-
-			response, err := common.Get(reqURL, cc.MaxTimeout, cc.MaxRetries)
+			parsedResponse, err := cc.fetchPage(ctx, config, indexURL, page)
 			if err != nil {
-				errors <- fmt.Errorf("[FetchPages] Request error: %w", err)
+				if !common.SendError(ctx, errs, fmt.Errorf("[FetchPages] page %d: %w", page, err)) {
+					return
+				}
+				continue
 			}
 
-			parsedResponse, err := cc.ParseResponse(response)
-			if err != nil {
-				errors <- fmt.Errorf("[FetchPages] Cannot parse response: %w", err)
+			if len(parsedResponse) == 0 {
+				continue
 			}
 			numResults += len(parsedResponse)
-			results <- parsedResponse
+
+			if !common.SendBatch(ctx, results, parsedResponse) {
+				return
+			}
 
 			if config.Limit != 0 && uint(numResults) >= config.Limit {
 				return
@@ -256,8 +316,7 @@ func (cc *CommonCrawl) filterIndices(config common.RequestConfig) []string {
 // Gets files from CommonCrawl storage using info from CdxResponse server
 //
 //	page: info about found web page in CdxResponse
-//	timeout: timeout in seconds
-func (cc *CommonCrawl) GetFile(page *common.CdxResponse) ([]byte, error) {
+func (cc *CommonCrawl) GetFile(ctx context.Context, page *common.CdxResponse) ([]byte, error) {
 	offset, _ := strconv.Atoi(page.Offset)
 	length, _ := strconv.Atoi(page.Length)
 	offsetEnd := offset + length + 1
@@ -265,7 +324,7 @@ func (cc *CommonCrawl) GetFile(page *common.CdxResponse) ([]byte, error) {
 	headers := map[string]string{
 		"Range": fmt.Sprintf("bytes=%v-%v", page.Offset, offsetEnd),
 	}
-	resp, err := common.DoRequest(CRAWL_STORAGE+page.Filename, cc.MaxTimeout, headers)
+	resp, err := cc.http().Do(ctx, cc.storageServer()+page.Filename, headers)
 	if err != nil {
 		return nil, fmt.Errorf("[GetFile] Request error: %v", err)
 	}

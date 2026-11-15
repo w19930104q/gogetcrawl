@@ -12,8 +12,7 @@ import (
 )
 
 type urlScenario struct {
-	outputFile      string
-	finishedWorkers uint
+	outputFile string
 }
 
 var urlScn = urlScenario{}
@@ -26,29 +25,6 @@ var urlCMD = &cobra.Command{
 	Run:     urlScn.spawnWorkers,
 }
 
-func (us *urlScenario) worker(configs chan common.RequestConfig) {
-	for {
-		select {
-		case config, ok := <-configs:
-			if ok {
-				var wg sync.WaitGroup
-
-				for _, s := range sources {
-					wg.Add(1)
-					go func(s common.Source) {
-						defer wg.Done()
-						s.FetchPages(config, results, errors)
-					}(s)
-				}
-				wg.Wait()
-			} else {
-				us.finishedWorkers += 1
-				return
-			}
-		}
-	}
-}
-
 func (us *urlScenario) spawnWorkers(cmd *cobra.Command, args []string) {
 	output, err := us.getOutputTarget()
 	if err != nil {
@@ -58,38 +34,32 @@ func (us *urlScenario) spawnWorkers(cmd *cobra.Command, args []string) {
 	configs := getRequestConfigs(args)
 	initSources()
 
+	ctx, stop := newSignalContext()
+	defer stop()
+
 	var wg sync.WaitGroup
+	var outMu sync.Mutex
 
 	// Spawn Workers
-	go func() {
-		for i := uint(0); i < maxWorkers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				us.worker(configs)
-			}()
-		}
-	}()
+	for i := uint(0); i < maxWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for config := range configs {
+				results, err := common.FetchAll(ctx, sources, config)
+				if err != nil {
+					log.Println(err)
+				}
 
-	close(configs)
-
-	// Read Results and errors
-	for us.finishedWorkers != maxWorkers {
-		select {
-		case res, ok := <-results:
-			if ok {
-				fmt.Fprintf(output, "%v", us.formatResultOutput(res))
+				outMu.Lock()
+				fmt.Fprintf(output, "%v", us.formatResultOutput(results))
+				outMu.Unlock()
 			}
-		case err, ok := <-errors:
-			if ok {
-				log.Println(err)
-			}
-		}
+		}()
 	}
 
+	close(configs)
 	wg.Wait()
-	close(results)
-	close(errors)
 }
 
 func (us *urlScenario) getOutputTarget() (io.Writer, error) {
